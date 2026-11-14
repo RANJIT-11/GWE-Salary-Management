@@ -1,0 +1,29 @@
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+**/dist/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables - NEVER upload secrets
+.env
+.env.*
+!.env.example
+frontend/.env
+backend/.env
+
+# IDE
+.vscode/
+
+# Logs
+*.log
