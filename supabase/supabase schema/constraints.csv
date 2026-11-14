@@ -1,0 +1,90 @@
+schema_name,table_name,constraint_name,constraint_type,definition
+public,activity_logs,activity_logs_actor_id_fkey,f,FOREIGN KEY (actor_id) REFERENCES profiles(id)
+public,activity_logs,activity_logs_pkey,p,PRIMARY KEY (id)
+public,notifications,notifications_pkey,p,PRIMARY KEY (id)
+public,notifications,notifications_related_penalty_id_fkey,f,FOREIGN KEY (related_penalty_id) REFERENCES penalties(id) ON DELETE RESTRICT
+public,notifications,notifications_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,payments,payments_amount_check,c,CHECK ((amount > (0)::numeric))
+public,payments,payments_pkey,p,PRIMARY KEY (id)
+public,payments,payments_recorded_by_fkey,f,FOREIGN KEY (recorded_by) REFERENCES profiles(id)
+public,payments,payments_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,penalties,penalties_amount_check,c,CHECK ((amount >= (0)::numeric))
+public,penalties,penalties_match_type_check,c,"CHECK ((match_type = ANY (ARRAY['B2B3'::text, 'B2B4'::text, 'B2B6'::text, 'b2b_3'::text, 'b2b_4'::text, 'b2b_6'::text])))"
+public,penalties,penalties_pkey,p,PRIMARY KEY (id)
+public,penalties,penalties_recorded_by_fkey,f,FOREIGN KEY (recorded_by) REFERENCES profiles(id)
+public,penalties,penalties_reversed_by_fkey,f,FOREIGN KEY (reversed_by) REFERENCES profiles(id)
+public,penalties,penalties_status_check,c,"CHECK ((status = ANY (ARRAY['active'::text, 'reversed'::text])))"
+public,penalties,penalties_submission_type_check,c,CHECK ((((penalty_type = 'approved_lobby'::text) AND (work_submission_id IS NOT NULL)) OR (penalty_type = 'incomplete_lobby'::text)))
+public,penalties,penalties_type_check,c,"CHECK ((penalty_type = ANY (ARRAY['approved_lobby'::text, 'incomplete_lobby'::text])))"
+public,penalties,penalties_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,penalties,penalties_work_submission_fkey,f,FOREIGN KEY (work_submission_id) REFERENCES work_submissions(id)
+public,penalties,penalties_work_type_check,c,"CHECK ((work_type = ANY (ARRAY['HOST'::text, 'PT'::text, 'HOST+PT'::text, 'host'::text, 'pt'::text, 'host+pt'::text])))"
+public,penalty_appeals,penalty_appeals_penalty_id_fkey,f,FOREIGN KEY (penalty_id) REFERENCES penalties(id)
+public,penalty_appeals,penalty_appeals_pkey,p,PRIMARY KEY (id)
+public,penalty_appeals,penalty_appeals_reviewed_by_fkey,f,FOREIGN KEY (reviewed_by) REFERENCES profiles(id)
+public,penalty_appeals,penalty_appeals_status_check,c,"CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))"
+public,penalty_appeals,penalty_appeals_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,penalty_catalog,penalty_catalog_calculation_mode_check,c,"CHECK ((calculation_mode = ANY (ARRAY['fixed'::text, 'per_minute'::text, 'per_match'::text, 'custom'::text, 'no_earning'::text])))"
+public,penalty_catalog,penalty_catalog_option_code_key,u,UNIQUE (option_code)
+public,penalty_catalog,penalty_catalog_pkey,p,PRIMARY KEY (id)
+public,penalty_items,penalty_items_check,c,"CHECK ((total_amount = round((unit_amount * quantity), 2)))"
+public,penalty_items,penalty_items_penalty_id_fkey,f,FOREIGN KEY (penalty_id) REFERENCES penalties(id) ON DELETE RESTRICT
+public,penalty_items,penalty_items_pkey,p,PRIMARY KEY (id)
+public,penalty_items,penalty_items_quantity_check,c,CHECK ((quantity > (0)::numeric))
+public,penalty_items,penalty_items_total_amount_check,c,CHECK ((total_amount >= (0)::numeric))
+public,penalty_items,penalty_items_unit_amount_check,c,CHECK ((unit_amount >= (0)::numeric))
+public,penalty_rate_history,penalty_rate_history_changed_by_fkey,f,FOREIGN KEY (changed_by) REFERENCES auth.users(id)
+public,penalty_rate_history,penalty_rate_history_pkey,p,PRIMARY KEY (id)
+public,pricebook_history,pricebook_history_changed_by_fkey,f,FOREIGN KEY (changed_by) REFERENCES profiles(id) ON DELETE SET NULL
+public,pricebook_history,pricebook_history_match_type_check,c,"CHECK ((match_type = ANY (ARRAY['b2b_3'::text, 'b2b_4'::text, 'b2b_6'::text])))"
+public,pricebook_history,pricebook_history_pkey,p,PRIMARY KEY (id)
+public,pricebook_history,pricebook_history_work_type_check,c,"CHECK ((work_type = ANY (ARRAY['host'::text, 'pt'::text, 'host_pt'::text])))"
+public,pricebook_rates,pricebook_rates_amount_check,c,CHECK ((amount > (0)::numeric))
+public,pricebook_rates,pricebook_rates_changed_by_fkey,f,FOREIGN KEY (changed_by) REFERENCES profiles(id) ON DELETE SET NULL
+public,pricebook_rates,pricebook_rates_match_type_check,c,"CHECK ((match_type = ANY (ARRAY['b2b_3'::text, 'b2b_4'::text, 'b2b_6'::text])))"
+public,pricebook_rates,pricebook_rates_pkey,p,PRIMARY KEY (id)
+public,pricebook_rates,pricebook_rates_work_type_check,c,"CHECK ((work_type = ANY (ARRAY['host'::text, 'pt'::text, 'host_pt'::text])))"
+public,pricebook_rates,pricebook_rates_work_type_match_type_effective_from_key,u,"UNIQUE (work_type, match_type, effective_from)"
+public,profiles,profiles_id_fkey,f,FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE
+public,profiles,profiles_pkey,p,PRIMARY KEY (id)
+public,profiles,profiles_role_check,c,"CHECK ((role = ANY (ARRAY['main_admin'::text, 'admin'::text, 'member'::text])))"
+public,profiles,profiles_username_key,u,UNIQUE (username)
+public,salary_adjustments,salary_adjustments_pkey,p,PRIMARY KEY (id)
+public,salary_adjustments,salary_adjustments_reason_check,c,CHECK ((char_length(TRIM(BOTH FROM reason)) >= 5))
+public,salary_adjustments,salary_adjustments_recorded_by_fkey,f,FOREIGN KEY (recorded_by) REFERENCES profiles(id)
+public,salary_adjustments,salary_adjustments_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,weekly_salary_ledger,weekly_salary_amounts_check,c,CHECK (((approved_earnings >= (0)::numeric) AND (payments_made >= (0)::numeric)))
+public,weekly_salary_ledger,weekly_salary_ledger_pkey,p,PRIMARY KEY (id)
+public,weekly_salary_ledger,weekly_salary_ledger_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,weekly_salary_ledger,weekly_salary_unique_period,u,"UNIQUE (user_id, week_start_date)"
+public,weekly_salary_ledger,weekly_salary_valid_dates,c,CHECK ((week_end_date >= week_start_date))
+public,work_correction_requests,valid_correction_match_type,c,"CHECK ((requested_match_type = ANY (ARRAY['b2b_3'::text, 'b2b_4'::text, 'b2b_6'::text])))"
+public,work_correction_requests,valid_correction_reason,c,CHECK ((length(TRIM(BOTH FROM reason)) >= 5))
+public,work_correction_requests,valid_correction_time,c,CHECK ((requested_lobby_end_time > requested_lobby_start_time))
+public,work_correction_requests,valid_correction_url,c,CHECK ((requested_lobby_url ~ '^https?://'::text))
+public,work_correction_requests,valid_correction_work_type,c,"CHECK ((requested_work_type = ANY (ARRAY['host'::text, 'pt'::text, 'host_pt'::text])))"
+public,work_correction_requests,work_correction_requests_pkey,p,PRIMARY KEY (id)
+public,work_correction_requests,work_correction_requests_reviewed_by_fkey,f,FOREIGN KEY (reviewed_by) REFERENCES profiles(id)
+public,work_correction_requests,work_correction_requests_status_check,c,"CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))"
+public,work_correction_requests,work_correction_requests_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,work_correction_requests,work_correction_requests_work_submission_id_fkey,f,FOREIGN KEY (work_submission_id) REFERENCES work_submissions(id) ON DELETE CASCADE
+public,work_earning_exclusions,work_earning_exclusions_penalty_id_fkey,f,FOREIGN KEY (penalty_id) REFERENCES penalties(id) ON DELETE RESTRICT
+public,work_earning_exclusions,work_earning_exclusions_pkey,p,PRIMARY KEY (id)
+public,work_earning_exclusions,work_earning_exclusions_recorded_by_fkey,f,FOREIGN KEY (recorded_by) REFERENCES profiles(id)
+public,work_earning_exclusions,work_earning_exclusions_reversed_by_fkey,f,FOREIGN KEY (reversed_by) REFERENCES profiles(id)
+public,work_earning_exclusions,work_earning_exclusions_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,work_earning_exclusions,work_earning_exclusions_work_submission_id_fkey,f,FOREIGN KEY (work_submission_id) REFERENCES work_submissions(id) ON DELETE RESTRICT
+public,work_earning_exclusions,work_earning_exclusions_work_submission_id_key,u,UNIQUE (work_submission_id)
+public,work_submissions,work_submissions_amount_check,c,CHECK ((amount >= (0)::numeric))
+public,work_submissions,work_submissions_approved_by_fkey,f,FOREIGN KEY (approved_by) REFERENCES profiles(id)
+public,work_submissions,work_submissions_match_type_check,c,"CHECK ((match_type = ANY (ARRAY['b2b_3'::text, 'b2b_4'::text, 'b2b_6'::text])))"
+public,work_submissions,work_submissions_pkey,p,PRIMARY KEY (id)
+public,work_submissions,work_submissions_status_check,c,"CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))"
+public,work_submissions,work_submissions_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,work_submissions,work_submissions_work_type_check,c,"CHECK ((work_type = ANY (ARRAY['host'::text, 'pt'::text, 'host_pt'::text])))"
+public,work_video_deletion_queue,work_video_deletion_queue_bucket_name_check,c,CHECK ((bucket_name = 'WORK PROOFS'::text))
+public,work_video_deletion_queue,work_video_deletion_queue_pkey,p,PRIMARY KEY (id)
+public,work_video_deletion_queue,work_video_deletion_queue_status_check,c,"CHECK ((status = ANY (ARRAY['pending'::text, 'deleted'::text])))"
+public,work_video_deletion_queue,work_video_deletion_queue_user_id_fkey,f,FOREIGN KEY (user_id) REFERENCES profiles(id)
+public,work_video_deletion_queue,work_video_deletion_queue_work_submission_id_fkey,f,FOREIGN KEY (work_submission_id) REFERENCES work_submissions(id) ON DELETE RESTRICT
+public,work_video_deletion_queue,work_video_deletion_queue_work_submission_id_key,u,UNIQUE (work_submission_id)

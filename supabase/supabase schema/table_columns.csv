@@ -1,0 +1,101 @@
+table_schema,table_name,column_name,data_type,is_nullable
+public,activity_logs,id,uuid,NO
+public,activity_logs,actor_id,uuid,YES
+public,activity_logs,action,text,NO
+public,activity_logs,details,jsonb,YES
+public,activity_logs,created_at,timestamp with time zone,NO
+public,notifications,id,uuid,NO
+public,notifications,user_id,uuid,NO
+public,notifications,title,text,NO
+public,notifications,message,text,NO
+public,notifications,notification_type,text,NO
+public,notifications,related_penalty_id,uuid,YES
+public,notifications,read_at,timestamp with time zone,YES
+public,notifications,created_at,timestamp with time zone,NO
+public,payments,id,uuid,NO
+public,payments,user_id,uuid,NO
+public,payments,amount,numeric,NO
+public,payments,payment_date,date,NO
+public,payments,payment_method,text,YES
+public,payments,reference_note,text,YES
+public,payments,recorded_by,uuid,YES
+public,payments,created_at,timestamp with time zone,NO
+public,penalties,id,uuid,NO
+public,penalties,user_id,uuid,NO
+public,penalties,amount,numeric,NO
+public,penalties,reason,text,NO
+public,penalties,recorded_by,uuid,YES
+public,penalties,created_at,timestamp with time zone,NO
+public,penalties,penalty_type,text,NO
+public,penalties,work_submission_id,uuid,YES
+public,penalties,lobby_date,date,NO
+public,penalties,lobby_start_time,time without time zone,NO
+public,penalties,lobby_end_time,time without time zone,NO
+public,penalties,lobby_url,text,NO
+public,penalties,work_type,text,NO
+public,penalties,match_type,text,NO
+public,penalties,status,text,NO
+public,penalties,reversed_at,timestamp with time zone,YES
+public,penalties,reversed_by,uuid,YES
+public,penalties,reversal_reason,text,YES
+public,penalties,appeal_deadline,timestamp with time zone,YES
+public,penalties,admin_lobby_url,text,YES
+public,penalty_appeals,id,uuid,NO
+public,penalty_appeals,penalty_id,uuid,NO
+public,penalty_appeals,user_id,uuid,NO
+public,penalty_appeals,explanation,text,NO
+public,penalty_appeals,lobby_url,text,NO
+public,penalty_appeals,video_path,text,NO
+public,penalty_appeals,status,text,NO
+public,penalty_appeals,admin_response,text,YES
+public,penalty_appeals,reviewed_by,uuid,YES
+public,penalty_appeals,reviewed_at,timestamp with time zone,YES
+public,penalty_appeals,submitted_at,timestamp with time zone,NO
+public,penalty_catalog,id,uuid,NO
+public,penalty_catalog,option_code,text,NO
+public,penalty_catalog,category,text,NO
+public,penalty_catalog,description,text,NO
+public,penalty_catalog,unit_amount,numeric,NO
+public,penalty_catalog,calculation_mode,text,NO
+public,penalty_catalog,exclude_earning,boolean,NO
+public,penalty_catalog,is_active,boolean,NO
+public,penalty_catalog,created_at,timestamp with time zone,NO
+public,penalty_items,id,uuid,NO
+public,penalty_items,penalty_id,uuid,NO
+public,penalty_items,option_code,text,NO
+public,penalty_items,description,text,NO
+public,penalty_items,unit_amount,numeric,NO
+public,penalty_items,quantity,numeric,NO
+public,penalty_items,total_amount,numeric,NO
+public,penalty_items,created_at,timestamp with time zone,NO
+public,penalty_items,exclude_earning,boolean,NO
+public,penalty_rate_history,id,uuid,NO
+public,penalty_rate_history,option_code,text,NO
+public,penalty_rate_history,old_amount,numeric,NO
+public,penalty_rate_history,new_amount,numeric,NO
+public,penalty_rate_history,changed_by,uuid,YES
+public,penalty_rate_history,changed_at,timestamp with time zone,NO
+public,pricebook_history,id,uuid,NO
+public,pricebook_history,work_type,text,NO
+public,pricebook_history,match_type,text,NO
+public,pricebook_history,old_amount,numeric,NO
+public,pricebook_history,new_amount,numeric,NO
+public,pricebook_history,changed_by,uuid,YES
+public,pricebook_history,changed_at,timestamp with time zone,NO
+public,pricebook_history,effective_from,date,NO
+public,pricebook_rates,id,uuid,NO
+public,pricebook_rates,work_type,text,NO
+public,pricebook_rates,match_type,text,NO
+public,pricebook_rates,amount,numeric,NO
+public,pricebook_rates,effective_from,date,NO
+public,pricebook_rates,changed_by,uuid,YES
+public,pricebook_rates,created_at,timestamp with time zone,NO
+public,profiles,id,uuid,NO
+public,profiles,username,text,NO
+public,profiles,full_name,text,YES
+public,profiles,role,text,NO
+public,profiles,is_active,boolean,NO
+public,profiles,created_at,timestamp with time zone,NO
+public,salary_adjustments,id,uuid,NO
+public,salary_adjustments,user_id,uuid,NO
+public,salary_adjustments,adjustment_amount,numeric,NO

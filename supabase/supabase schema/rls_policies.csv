@@ -1,0 +1,41 @@
+schemaname,tablename,policyname,permissive,roles,cmd,qual,with_check
+public,activity_logs,Admins can add activity logs,PERMISSIVE,{authenticated},INSERT,null,"((actor_id = ( SELECT auth.uid() AS uid)) AND (current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])))"
+public,activity_logs,Admins can view activity logs,PERMISSIVE,{authenticated},SELECT,"(current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text]))",null
+public,notifications,notifications_select_own,PERMISSIVE,{authenticated},SELECT,(user_id = ( SELECT auth.uid() AS uid)),null
+public,notifications,notifications_update_own,PERMISSIVE,{authenticated},UPDATE,(user_id = ( SELECT auth.uid() AS uid)),(user_id = ( SELECT auth.uid() AS uid))
+public,payments,Admins can record member payments,PERMISSIVE,{authenticated},INSERT,null,"((current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])) AND (EXISTS ( SELECT 1
+   FROM profiles p
+  WHERE ((p.id = payments.user_id) AND (p.role = 'member'::text)))) AND (recorded_by = ( SELECT auth.uid() AS uid)))"
+public,payments,Users can view permitted payments,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null
+public,penalties,Admins can add member penalties,PERMISSIVE,{authenticated},INSERT,null,"((current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])) AND (EXISTS ( SELECT 1
+   FROM profiles p
+  WHERE ((p.id = penalties.user_id) AND (p.role = 'member'::text)))) AND (recorded_by = ( SELECT auth.uid() AS uid)))"
+public,penalties,Users can view permitted penalties,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null
+public,penalty_appeals,Members and admins can view appeals,PERMISSIVE,{authenticated},SELECT,"((user_id = auth.uid()) OR (current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])))",null
+public,penalty_appeals,Members can submit own appeals,PERMISSIVE,{authenticated},INSERT,null,"((user_id = ( SELECT auth.uid() AS uid)) AND (current_user_role() = 'member'::text) AND (status = 'pending'::text) AND (reviewed_by IS NULL) AND (reviewed_at IS NULL) AND (EXISTS ( SELECT 1
+   FROM penalties p
+  WHERE ((p.id = penalty_appeals.penalty_id) AND (p.user_id = ( SELECT auth.uid() AS uid)) AND (p.status = 'active'::text) AND (p.appeal_deadline IS NOT NULL) AND (now() <= p.appeal_deadline)))))"
+public,penalty_catalog,penalty_catalog_authenticated_read,PERMISSIVE,{authenticated},SELECT,true,null
+public,penalty_items,penalty_items_select,PERMISSIVE,{authenticated},SELECT,"(EXISTS ( SELECT 1
+   FROM penalties p
+  WHERE ((p.id = penalty_items.penalty_id) AND can_view_user(p.user_id))))",null
+public,penalty_rate_history,penalty_rate_history_main_admin_read,PERMISSIVE,{authenticated},SELECT,(current_user_role() = 'main_admin'::text),null
+public,pricebook_history,Authenticated users can view pricebook history,PERMISSIVE,{authenticated},SELECT,true,null
+public,pricebook_rates,Authenticated users can view pricebook,PERMISSIVE,{authenticated},SELECT,true,null
+public,profiles,Only main admins can update profiles,PERMISSIVE,{authenticated},UPDATE,(current_user_role() = 'main_admin'::text),(current_user_role() = 'main_admin'::text)
+public,profiles,Profiles can be viewed,PERMISSIVE,{authenticated},SELECT,can_view_user(id),null
+public,salary_adjustments,salary_adjustments_select,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null
+public,weekly_salary_ledger,Admins can insert weekly salary ledger,PERMISSIVE,{authenticated},INSERT,null,"((current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])) AND (EXISTS ( SELECT 1
+   FROM profiles p
+  WHERE ((p.id = weekly_salary_ledger.user_id) AND (p.role = 'member'::text)))))"
+public,weekly_salary_ledger,Admins can update weekly salary ledger,PERMISSIVE,{authenticated},UPDATE,"(current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text]))","(current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text]))"
+public,weekly_salary_ledger,Users can view permitted weekly salary,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null
+public,work_correction_requests,Members can submit own correction requests,PERMISSIVE,{authenticated},INSERT,null,"((user_id = ( SELECT auth.uid() AS uid)) AND (status = 'pending'::text) AND (reviewed_by IS NULL) AND (reviewed_at IS NULL) AND (EXISTS ( SELECT 1
+   FROM work_submissions w
+  WHERE ((w.id = work_correction_requests.work_submission_id) AND (w.user_id = ( SELECT auth.uid() AS uid)) AND (w.status = ANY (ARRAY['pending'::text, 'approved'::text]))))))"
+public,work_correction_requests,Users can view permitted correction requests,PERMISSIVE,{authenticated},SELECT,"((user_id = ( SELECT auth.uid() AS uid)) OR (current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])))",null
+public,work_earning_exclusions,work_earning_exclusions_select,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null
+public,work_submissions,Admins can submit own work,PERMISSIVE,{authenticated},INSERT,null,"((user_id = auth.uid()) AND (current_user_role() = ANY (ARRAY['admin'::text, 'main_admin'::text])) AND (((current_user_role() = 'admin'::text) AND (status = 'pending'::text) AND (amount = (0)::numeric) AND (approved_by IS NULL) AND (approved_at IS NULL)) OR ((current_user_role() = 'main_admin'::text) AND (status = 'approved'::text) AND (amount > (0)::numeric) AND (approved_by = auth.uid()) AND (approved_at IS NOT NULL))))"
+public,work_submissions,Authorized admins can update work,PERMISSIVE,{authenticated},UPDATE,can_approve_work(user_id),can_approve_work(user_id)
+public,work_submissions,Members can submit own work,PERMISSIVE,{authenticated},INSERT,null,((user_id = ( SELECT auth.uid() AS uid)) AND (current_user_role() = 'member'::text) AND (status = 'pending'::text) AND (amount = (0)::numeric) AND (approved_by IS NULL))
+public,work_submissions,Users can view permitted work,PERMISSIVE,{authenticated},SELECT,can_view_user(user_id),null

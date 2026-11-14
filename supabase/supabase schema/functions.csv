@@ -1,0 +1,1986 @@
+schema_name,function_name,arguments,return_type,function_definition
+public,apply_incomplete_lobby_penalty,"p_work_submission_id uuid, p_amount numeric, p_reason text, p_admin_lobby_url text",uuid,"CREATE OR REPLACE FUNCTION public.apply_incomplete_lobby_penalty(p_work_submission_id uuid, p_amount numeric, p_reason text, p_admin_lobby_url text)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+
+DECLARE
+    v_role TEXT;
+    v_member_role TEXT;
+    v_work public.work_submissions%ROWTYPE;
+    v_penalty_id UUID;
+    v_reason TEXT;
+    v_admin_lobby_url TEXT;
+
+BEGIN
+
+    -- Authentication
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+
+    v_role := public.current_user_role();
+
+    IF v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can apply this penalty';
+    END IF;
+
+    -- Validate amount and reason
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Penalty amount must be greater than zero';
+    END IF;
+
+    v_reason := NULLIF(TRIM(p_reason), '');
+
+    IF v_reason IS NULL OR LENGTH(v_reason) < 3 THEN
+        RAISE EXCEPTION 'Please enter a valid incomplete lobby reason';
+    END IF;
+
+    -- Validate admin lobby link
+    v_admin_lobby_url := NULLIF(TRIM(p_admin_lobby_url), '');
+
+    IF v_admin_lobby_url IS NULL THEN
+        RAISE EXCEPTION 'Please enter the lobby link';
+    END IF;
+
+    IF v_admin_lobby_url !~* '^https?://' THEN
+        RAISE EXCEPTION 'Please enter a valid HTTP or HTTPS lobby link';
+    END IF;
+
+    -- Lock pending work
+    SELECT *
+    INTO v_work
+    FROM public.work_submissions
+    WHERE id = p_work_submission_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Work submission not found';
+    END IF;
+
+    IF v_work.status <> 'pending' THEN
+        RAISE EXCEPTION 'This work is no longer pending';
+    END IF;
+
+    -- Verify active member
+    SELECT role
+    INTO v_member_role
+    FROM public.profiles
+    WHERE id = v_work.user_id
+      AND is_active = TRUE;
+
+    IF v_member_role IS DISTINCT FROM 'member' THEN
+        RAISE EXCEPTION 'Work owner is not an active member';
+    END IF;
+
+    IF NOT public.can_approve_work(v_work.user_id) THEN
+        RAISE EXCEPTION 'You are not authorized to process this work';
+    END IF;
+
+    -- Approve work for audit
+    UPDATE public.work_submissions
+    SET status = 'approved'
+    WHERE id = v_work.id
+      AND status = 'pending';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Work approval failed';
+    END IF;
+
+    -- Create incomplete lobby penalty
+    INSERT INTO public.penalties (
+        user_id,
+        amount,
+        reason,
+        recorded_by,
+        penalty_type,
+        work_submission_id,
+        lobby_date,
+        lobby_start_time,
+        lobby_end_time,
+        lobby_url,
+        admin_lobby_url,
+        work_type,
+        match_type,
+        appeal_deadline
+    )
+    VALUES (
+        v_work.user_id,
+        ROUND(p_amount, 2),
+        v_reason,
+        auth.uid(),
+        'incomplete_lobby',
+        v_work.id,
+        v_work.lobby_date,
+        v_work.lobby_start_time,
+        v_work.lobby_end_time,
+        v_work.lobby_url,
+        v_admin_lobby_url,
+        CASE LOWER(v_work.work_type)
+            WHEN 'host' THEN 'HOST'
+            WHEN 'pt' THEN 'PT'
+            WHEN 'host_pt' THEN 'HOST+PT'
+            ELSE UPPER(v_work.work_type)
+        END,
+        REPLACE(UPPER(v_work.match_type), '_', ''),
+        NOW() + INTERVAL '24 hours'
+    )
+    RETURNING id INTO v_penalty_id;
+
+    -- Exclude entire lobby earning
+    INSERT INTO public.work_earning_exclusions (
+        work_submission_id,
+        penalty_id,
+        user_id,
+        reason,
+        recorded_by
+    )
+    VALUES (
+        v_work.id,
+        v_penalty_id,
+        v_work.user_id,
+        'Incomplete Lobby: ' || v_reason,
+        auth.uid()
+    );
+
+    -- Notify worker
+    INSERT INTO public.notifications (
+        user_id,
+        title,
+        message,
+        notification_type,
+        related_penalty_id
+    )
+    VALUES (
+        v_work.user_id,
+        'Incomplete Lobby Penalty',
+        'Your lobby has been marked as incomplete. Penalty: Rs. ' ||
+        ROUND(p_amount, 2)::TEXT ||
+        '. This lobby earning is excluded. You have 24 hours to appeal.',
+        'penalty',
+        v_penalty_id
+    );
+
+    -- Recalculate salary
+    PERFORM public.recalculate_weekly_salary(v_work.user_id);
+
+    RETURN v_penalty_id;
+
+END;
+
+$function$
+"
+public,apply_penalty_and_approve_work,"p_work_submission_id uuid, p_items jsonb",uuid,"CREATE OR REPLACE FUNCTION public.apply_penalty_and_approve_work(p_work_submission_id uuid, p_items jsonb)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_member_role TEXT;
+
+    v_work public.work_submissions%ROWTYPE;
+    v_catalog public.penalty_catalog%ROWTYPE;
+
+    v_item JSONB;
+    v_saved_item JSONB;
+
+    v_code TEXT;
+    v_description TEXT;
+    v_mode TEXT;
+
+    v_quantity NUMERIC(12,2);
+    v_unit_amount NUMERIC(12,2);
+    v_item_total NUMERIC(12,2);
+    v_total NUMERIC(12,2) := 0;
+
+    v_has_exclusion BOOLEAN := FALSE;
+    v_has_sleep BOOLEAN := FALSE;
+
+    v_reason TEXT := '';
+    v_exclusion_reason TEXT := '';
+    v_normalized_items JSONB := '[]'::JSONB;
+
+    v_penalty_type TEXT;
+    v_penalty_id UUID;
+BEGIN
+
+    -- Authenticate administrator.
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+
+    v_role := public.current_user_role();
+
+    IF v_role IS NULL OR v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can apply penalties';
+    END IF;
+
+
+    -- Validate input.
+    IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+        RAISE EXCEPTION 'Penalty items must be provided as an array';
+    END IF;
+
+    IF jsonb_array_length(p_items) = 0 THEN
+        RAISE EXCEPTION 'Select at least one penalty option';
+    END IF;
+
+
+    -- Lock the work submission.
+    SELECT *
+    INTO v_work
+    FROM public.work_submissions
+    WHERE id = p_work_submission_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Work submission not found';
+    END IF;
+
+    IF v_work.status <> 'pending' THEN
+        RAISE EXCEPTION 'This work is no longer pending';
+    END IF;
+
+    SELECT role
+    INTO v_member_role
+    FROM public.profiles
+    WHERE id = v_work.user_id
+      AND is_active = TRUE;
+
+    IF v_member_role IS DISTINCT FROM 'member' THEN
+        RAISE EXCEPTION 'Work owner is not an active member';
+    END IF;
+
+    IF NOT public.can_approve_work(v_work.user_id) THEN
+        RAISE EXCEPTION 'You are not authorized to approve this work';
+    END IF;
+
+
+    -- Validate and calculate each selected penalty.
+    FOR v_item IN
+        SELECT value
+        FROM jsonb_array_elements(p_items) AS items(value)
+    LOOP
+
+        v_code := NULLIF(TRIM(v_item->>'option_code'), '');
+
+        IF v_code IS NULL THEN
+            RAISE EXCEPTION 'Invalid penalty option';
+        END IF;
+
+        v_quantity :=
+            COALESCE(NULLIF(v_item->>'quantity', '')::NUMERIC, 1);
+
+        IF v_quantity <= 0 THEN
+            RAISE EXCEPTION 'Penalty quantity must be greater than zero';
+        END IF;
+
+
+        IF v_code = 'custom_issue' THEN
+
+            v_description :=
+                NULLIF(TRIM(v_item->>'description'), '');
+
+            IF v_description IS NULL
+               OR LENGTH(v_description) < 3 THEN
+                RAISE EXCEPTION 'Enter a valid custom issue description';
+            END IF;
+
+            v_unit_amount :=
+                NULLIF(v_item->>'unit_amount', '')::NUMERIC;
+
+            IF v_unit_amount IS NULL OR v_unit_amount <= 0 THEN
+                RAISE EXCEPTION 'Enter a valid custom penalty amount';
+            END IF;
+
+            v_mode := 'custom';
+
+        ELSE
+
+            SELECT *
+            INTO v_catalog
+            FROM public.penalty_catalog
+            WHERE option_code = v_code
+              AND is_active = TRUE
+            FOR SHARE;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Invalid or inactive penalty option: %', v_code;
+            END IF;
+
+            v_description := v_catalog.description;
+            v_unit_amount := v_catalog.unit_amount;
+            v_mode := v_catalog.calculation_mode;
+
+        END IF;
+
+
+        IF v_mode IN ('per_minute', 'per_match')
+           AND v_quantity <> TRUNC(v_quantity) THEN
+            RAISE EXCEPTION 'Minutes and match quantities must be whole numbers';
+        END IF;
+
+        v_item_total := ROUND(v_unit_amount * v_quantity, 2);
+
+        IF v_mode = 'no_earning' THEN
+            v_item_total := 0;
+        END IF;
+
+        v_total := v_total + v_item_total;
+
+        IF v_code = 'sleep_during_work' THEN
+            v_has_sleep := TRUE;
+        END IF;
+
+        IF v_code <> 'custom_issue' THEN
+            IF v_catalog.exclude_earning THEN
+                v_has_exclusion := TRUE;
+
+                v_exclusion_reason :=
+                    CONCAT_WS(
+                        '; ',
+                        NULLIF(v_exclusion_reason, ''),
+                        v_description
+                    );
+            END IF;
+        END IF;
+
+
+        v_reason := CONCAT_WS(
+            '; ',
+            NULLIF(v_reason, ''),
+            v_description || ' x ' || v_quantity::TEXT
+        );
+
+        v_normalized_items :=
+            v_normalized_items ||
+            jsonb_build_array(
+                jsonb_build_object(
+                    'option_code', v_code,
+                    'description', v_description,
+                    'unit_amount', v_unit_amount,
+                    'quantity', v_quantity,
+                    'total_amount', v_item_total,
+                    'exclude_earning',
+                        CASE
+                            WHEN v_code = 'custom_issue' THEN FALSE
+                            ELSE v_catalog.exclude_earning
+                        END
+                )
+            );
+
+    END LOOP;
+
+
+    IF v_total = 0 AND NOT v_has_exclusion THEN
+        RAISE EXCEPTION 'No valid penalty amount or earning exclusion was selected';
+    END IF;
+
+
+    -- Sleep During Work is classified as incomplete lobby.
+    IF v_has_sleep THEN
+        v_penalty_type := 'incomplete_lobby';
+    ELSE
+        v_penalty_type := 'approved_lobby';
+    END IF;
+
+
+    -- Approve the work.
+    -- Existing BEFORE trigger calculates the Pricebook amount.
+    UPDATE public.work_submissions
+    SET status = 'approved'
+    WHERE id = p_work_submission_id
+      AND status = 'pending';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Work approval failed';
+    END IF;
+
+
+    -- Create one penalty record for this lobby.
+    INSERT INTO public.penalties (
+        user_id,
+        amount,
+        reason,
+        recorded_by,
+        penalty_type,
+        work_submission_id,
+        lobby_date,
+        lobby_start_time,
+        lobby_end_time,
+        lobby_url,
+        work_type,
+        match_type,
+        appeal_deadline
+    )
+    VALUES (
+        v_work.user_id,
+        v_total,
+        v_reason,
+        auth.uid(),
+        v_penalty_type,
+        v_work.id,
+        v_work.lobby_date,
+        v_work.lobby_start_time,
+        v_work.lobby_end_time,
+        v_work.lobby_url,
+        CASE LOWER(v_work.work_type)
+            WHEN 'host' THEN 'HOST'
+            WHEN 'pt' THEN 'PT'
+            WHEN 'host_pt' THEN 'HOST+PT'
+            ELSE v_work.work_type
+        END,
+        REPLACE(UPPER(v_work.match_type), '_', ''),
+        NOW() + INTERVAL '24 hours'
+    )
+    RETURNING id INTO v_penalty_id;
+
+
+    -- Store each selected penalty item.
+    FOR v_saved_item IN
+        SELECT value
+        FROM jsonb_array_elements(v_normalized_items) AS items(value)
+    LOOP
+
+        INSERT INTO public.penalty_items (
+            penalty_id,
+            option_code,
+            description,
+            unit_amount,
+            quantity,
+            total_amount,
+            exclude_earning
+        )
+        VALUES (
+            v_penalty_id,
+            v_saved_item->>'option_code',
+            v_saved_item->>'description',
+            (v_saved_item->>'unit_amount')::NUMERIC,
+            (v_saved_item->>'quantity')::NUMERIC,
+            (v_saved_item->>'total_amount')::NUMERIC,
+            (v_saved_item->>'exclude_earning')::BOOLEAN
+        );
+
+    END LOOP;
+
+
+    -- Exclude the lobby earning for Sleep During Work
+    -- or Wrong Point Calculation.
+    IF v_has_exclusion THEN
+
+        INSERT INTO public.work_earning_exclusions (
+            work_submission_id,
+            penalty_id,
+            user_id,
+            reason,
+            recorded_by
+        )
+        VALUES (
+            v_work.id,
+            v_penalty_id,
+            v_work.user_id,
+            v_exclusion_reason,
+            auth.uid()
+        );
+
+    END IF;
+
+
+    -- Notify the worker.
+    INSERT INTO public.notifications (
+        user_id,
+        title,
+        message,
+        notification_type,
+        related_penalty_id
+    )
+    VALUES (
+        v_work.user_id,
+        'Penalty Applied',
+        'A penalty of Rs. ' ||
+            v_total::TEXT ||
+            ' has been applied to your work. You have 24 hours to appeal.',
+        'penalty',
+        v_penalty_id
+    );
+
+
+    -- Recalculate after earning exclusion has been recorded.
+    PERFORM public.recalculate_weekly_salary(v_work.user_id);
+
+    RETURN v_penalty_id;
+
+END;
+$function$
+"
+public,can_approve_work,target_id uuid,boolean,"CREATE OR REPLACE FUNCTION public.can_approve_work(target_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+    SELECT
+        target_id <> (SELECT auth.uid())
+        AND (
+            public.current_user_role() = 'main_admin'
+            OR (
+                public.current_user_role() = 'admin'
+                AND EXISTS (
+                    SELECT 1 FROM public.profiles p
+                    WHERE p.id = target_id AND p.role = 'member'
+                )
+            )
+        );
+$function$
+"
+public,can_view_user,target_id uuid,boolean,"CREATE OR REPLACE FUNCTION public.can_view_user(target_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+    SELECT
+        target_id = (SELECT auth.uid())
+        OR public.current_user_role() = 'main_admin'
+        OR (
+            public.current_user_role() = 'admin'
+            AND EXISTS (
+                SELECT 1 FROM public.profiles p
+                WHERE p.id = target_id AND p.role = 'member'
+            )
+        );
+$function$
+"
+public,capture_work_correction_original,,trigger,"CREATE OR REPLACE FUNCTION public.capture_work_correction_original()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+BEGIN
+    SELECT jsonb_build_object(
+        'lobby_date', w.lobby_date,
+        'lobby_start_time', w.lobby_start_time,
+        'lobby_end_time', w.lobby_end_time,
+        'lobby_url', w.lobby_url,
+        'video_url', w.video_url,
+        'work_type', w.work_type,
+        'match_type', w.match_type,
+        'status', w.status,
+        'amount', w.amount
+    )
+    INTO NEW.original_details
+    FROM public.work_submissions w
+    WHERE w.id = NEW.work_submission_id
+      AND w.user_id = auth.uid()
+      AND w.status IN ('pending', 'approved')
+    FOR UPDATE;
+
+    IF NEW.original_details IS NULL THEN
+        RAISE EXCEPTION 'Work not found or correction not allowed';
+    END IF;
+
+    IF NEW.user_id <> auth.uid() THEN
+        RAISE EXCEPTION 'You can only request correction for your own work';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,create_member_profile,,trigger,"CREATE OR REPLACE FUNCTION public.create_member_profile()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE
+    generated_username TEXT;
+    entered_username TEXT;
+    entered_full_name TEXT;
+BEGIN
+    entered_username := LOWER(
+        BTRIM(COALESCE(NEW.raw_user_meta_data ->> 'username', ''))
+    );
+
+    entered_full_name := NULLIF(
+        BTRIM(COALESCE(NEW.raw_user_meta_data ->> 'full_name', '')),
+        ''
+    );
+
+    -- Generate a fallback username if missing
+    IF entered_username = '' THEN
+        generated_username := 'member_' || LEFT(REPLACE(NEW.id::TEXT, '-', ''), 12);
+    ELSE
+        generated_username := entered_username;
+    END IF;
+
+    -- Keep username unique
+    IF EXISTS (
+        SELECT 1
+        FROM public.profiles p
+        WHERE p.username = generated_username
+    ) THEN
+        generated_username := 'member_' || LEFT(REPLACE(NEW.id::TEXT, '-', ''), 12);
+    END IF;
+
+    INSERT INTO public.profiles (
+        id,
+        username,
+        full_name,
+        role,
+        is_active
+    )
+    VALUES (
+        NEW.id,
+        generated_username,
+        entered_full_name,
+        'member',
+        TRUE
+    )
+    ON CONFLICT (id) DO NOTHING;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,current_user_role,,text,"CREATE OR REPLACE FUNCTION public.current_user_role()
+ RETURNS text
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+    SELECT p.role
+    FROM public.profiles p
+    WHERE p.id = (SELECT auth.uid())
+      AND p.is_active = TRUE
+    LIMIT 1;
+$function$
+"
+public,enqueue_work_video_deletion,,trigger,"CREATE OR REPLACE FUNCTION public.enqueue_work_video_deletion()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+BEGIN
+
+    IF TG_OP = 'INSERT' THEN
+
+        IF NEW.status = 'approved'
+           AND NULLIF(TRIM(NEW.video_url), '') IS NOT NULL
+           AND NEW.approved_at IS NOT NULL THEN
+
+            INSERT INTO public.work_video_deletion_queue (
+                work_submission_id,
+                user_id,
+                object_path,
+                bucket_name,
+                scheduled_delete_at
+            )
+            VALUES (
+                NEW.id,
+                NEW.user_id,
+                NEW.video_url,
+                'WORK PROOFS',
+                NEW.approved_at + INTERVAL '24 hours'
+            )
+            ON CONFLICT (work_submission_id) DO NOTHING;
+
+        END IF;
+
+    ELSIF TG_OP = 'UPDATE' THEN
+
+        IF OLD.status = 'pending'
+           AND NEW.status = 'approved'
+           AND NULLIF(TRIM(NEW.video_url), '') IS NOT NULL
+           AND NEW.approved_at IS NOT NULL THEN
+
+            INSERT INTO public.work_video_deletion_queue (
+                work_submission_id,
+                user_id,
+                object_path,
+                bucket_name,
+                scheduled_delete_at
+            )
+            VALUES (
+                NEW.id,
+                NEW.user_id,
+                NEW.video_url,
+                'WORK PROOFS',
+                NEW.approved_at + INTERVAL '24 hours'
+            )
+            ON CONFLICT (work_submission_id) DO NOTHING;
+
+        END IF;
+
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,is_pricebook_main_admin,,boolean,"CREATE OR REPLACE FUNCTION public.is_pricebook_main_admin()
+ RETURNS boolean
+ LANGUAGE sql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.profiles
+        WHERE id = auth.uid()
+          AND role = 'main_admin'
+    );
+$function$
+"
+public,manage_member_role,"p_user_id uuid, p_new_role text",void,"CREATE OR REPLACE FUNCTION public.manage_member_role(p_user_id uuid, p_new_role text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE
+    v_admin_role TEXT;
+    v_target_role TEXT;
+BEGIN
+
+    SELECT role
+    INTO v_admin_role
+    FROM public.profiles
+    WHERE id = auth.uid();
+
+    IF v_admin_role IS DISTINCT FROM 'main_admin' THEN
+        RAISE EXCEPTION 'Only Main Admin can manage roles';
+    END IF;
+
+    IF p_new_role NOT IN ('member', 'admin') THEN
+        RAISE EXCEPTION 'Invalid target role';
+    END IF;
+
+    SELECT role
+    INTO v_target_role
+    FROM public.profiles
+    WHERE id = p_user_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'User not found';
+    END IF;
+
+    IF v_target_role = 'main_admin' THEN
+        RAISE EXCEPTION 'Main Admin accounts are protected';
+    END IF;
+
+    PERFORM pg_catalog.set_config(
+        'app.allow_profile_role_change',
+        'on',
+        true
+    );
+
+    UPDATE public.profiles
+    SET role = p_new_role
+    WHERE id = p_user_id;
+
+    PERFORM pg_catalog.set_config(
+        'app.allow_profile_role_change',
+        'off',
+        true
+    );
+
+END;
+$function$
+"
+public,protect_profile_roles,,trigger,"CREATE OR REPLACE FUNCTION public.protect_profile_roles()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE
+    main_admin_count INTEGER;
+    role_change_allowed BOOLEAN;
+BEGIN
+    role_change_allowed :=
+        COALESCE(
+            pg_catalog.current_setting(
+                'app.allow_profile_role_change',
+                true
+            ),
+            'off'
+        ) = 'on';
+
+    IF auth.uid() IS NOT NULL THEN
+
+        IF TG_OP = 'INSERT' AND NEW.role <> 'member' THEN
+            RAISE EXCEPTION 'New accounts must have member role';
+        END IF;
+
+        IF TG_OP = 'UPDATE'
+           AND NEW.role IS DISTINCT FROM OLD.role THEN
+
+            IF NOT (
+                role_change_allowed
+                AND public.current_user_role() = 'main_admin'
+                AND OLD.role IN ('member', 'admin')
+                AND NEW.role IN ('member', 'admin')
+            ) THEN
+                RAISE EXCEPTION 'Unauthorized role change';
+            END IF;
+
+        END IF;
+    END IF;
+
+    IF NEW.role = 'main_admin' THEN
+        SELECT COUNT(*)
+        INTO main_admin_count
+        FROM public.profiles p
+        WHERE p.role = 'main_admin'
+          AND p.id <> NEW.id;
+
+        IF main_admin_count >= 2 THEN
+            RAISE EXCEPTION 'Only two Main Admin accounts are allowed';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,recalculate_weekly_salary,p_user_id uuid,void,"CREATE OR REPLACE FUNCTION public.recalculate_weekly_salary(p_user_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_first_date DATE;
+    v_week_start DATE;
+    v_week_end DATE;
+
+    v_opening NUMERIC(12,2) := 0;
+    v_earnings NUMERIC(12,2);
+    v_penalties NUMERIC(12,2);
+    v_payments NUMERIC(12,2);
+    v_adjustments NUMERIC(12,2);
+    v_closing NUMERIC(12,2);
+
+    v_role TEXT;
+BEGIN
+
+    SELECT role
+    INTO v_role
+    FROM public.profiles
+    WHERE id = auth.uid();
+
+    IF auth.uid() IS NOT NULL
+       AND (v_role IS NULL OR v_role NOT IN ('admin', 'main_admin')) THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can recalculate salary';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.profiles
+        WHERE id = p_user_id
+          AND role IN ('member', 'admin', 'main_admin')
+    ) THEN
+        RAISE EXCEPTION 'Invalid account';
+    END IF;
+
+    SELECT MIN(activity_date)
+    INTO v_first_date
+    FROM (
+        SELECT lobby_date AS activity_date
+        FROM public.work_submissions
+        WHERE user_id = p_user_id
+          AND status = 'approved'
+
+        UNION ALL
+
+        SELECT lobby_date
+        FROM public.penalties
+        WHERE user_id = p_user_id
+          AND status = 'active'
+
+        UNION ALL
+
+        SELECT payment_date
+        FROM public.payments
+        WHERE user_id = p_user_id
+
+        UNION ALL
+
+        SELECT week_start_date
+        FROM public.weekly_salary_ledger
+        WHERE user_id = p_user_id
+
+        UNION ALL
+
+        SELECT effective_date
+        FROM public.salary_adjustments
+        WHERE user_id = p_user_id
+    ) activities;
+
+    IF v_first_date IS NULL THEN
+        RETURN;
+    END IF;
+
+    v_week_start := v_first_date
+        - (EXTRACT(ISODOW FROM v_first_date)::INTEGER - 1);
+
+    WHILE v_week_start <= CURRENT_DATE LOOP
+
+        v_week_end := v_week_start + 6;
+
+        SELECT COALESCE(SUM(w.amount), 0)
+        INTO v_earnings
+        FROM public.work_submissions w
+        WHERE w.user_id = p_user_id
+          AND w.status = 'approved'
+          AND w.lobby_date BETWEEN v_week_start AND v_week_end
+          AND NOT EXISTS (
+              SELECT 1
+              FROM public.work_earning_exclusions e
+              WHERE e.work_submission_id = w.id
+                AND e.is_active = TRUE
+          );
+
+        SELECT COALESCE(SUM(amount), 0)
+        INTO v_penalties
+        FROM public.penalties
+        WHERE user_id = p_user_id
+          AND status = 'active'
+          AND lobby_date BETWEEN v_week_start AND v_week_end;
+
+        SELECT COALESCE(SUM(amount), 0)
+        INTO v_payments
+        FROM public.payments
+        WHERE user_id = p_user_id
+          AND payment_date BETWEEN v_week_start AND v_week_end;
+
+        SELECT COALESCE(SUM(adjustment_amount), 0)
+        INTO v_adjustments
+        FROM public.salary_adjustments
+        WHERE user_id = p_user_id
+          AND effective_date BETWEEN v_week_start AND v_week_end;
+
+        v_closing :=
+            v_opening
+            + v_earnings
+            - v_penalties
+            - v_payments
+            + v_adjustments;
+
+        INSERT INTO public.weekly_salary_ledger (
+            user_id,
+            week_start_date,
+            week_end_date,
+            opening_balance,
+            approved_earnings,
+            payments_made,
+            closing_balance
+        )
+        VALUES (
+            p_user_id,
+            v_week_start,
+            v_week_end,
+            v_opening,
+            v_earnings,
+            v_payments,
+            v_closing
+        )
+        ON CONFLICT (user_id, week_start_date)
+        DO UPDATE SET
+            week_end_date = EXCLUDED.week_end_date,
+            opening_balance = EXCLUDED.opening_balance,
+            approved_earnings = EXCLUDED.approved_earnings,
+            payments_made = EXCLUDED.payments_made,
+            closing_balance = EXCLUDED.closing_balance;
+
+        v_opening := v_closing;
+        v_week_start := v_week_start + 7;
+
+    END LOOP;
+
+END;
+$function$
+"
+public,review_penalty_appeal,"p_appeal_id uuid, p_decision text, p_admin_response text",void,"CREATE OR REPLACE FUNCTION public.review_penalty_appeal(p_appeal_id uuid, p_decision text, p_admin_response text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_appeal RECORD;
+    v_penalty_type TEXT;
+BEGIN
+
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+
+    v_role := public.current_user_role();
+
+    IF v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can review appeals';
+    END IF;
+
+    IF p_decision IS NULL
+       OR p_decision NOT IN ('approved', 'rejected') THEN
+        RAISE EXCEPTION 'Invalid appeal decision';
+    END IF;
+
+    IF p_decision = 'rejected'
+       AND NULLIF(TRIM(p_admin_response), '') IS NULL THEN
+        RAISE EXCEPTION 'Rejection reason is required';
+    END IF;
+
+    -- Lock appeal
+    SELECT *
+    INTO v_appeal
+    FROM public.penalty_appeals
+    WHERE id = p_appeal_id
+      AND status = 'pending'
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pending appeal not found or already reviewed';
+    END IF;
+
+    -- Lock associated penalty and get its type
+    SELECT penalty_type
+    INTO v_penalty_type
+    FROM public.penalties
+    WHERE id = v_appeal.penalty_id
+      AND user_id = v_appeal.user_id
+      AND status = 'active'
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Active penalty not found';
+    END IF;
+
+    -- Save appeal decision
+    UPDATE public.penalty_appeals
+    SET
+        status = p_decision,
+        admin_response = NULLIF(TRIM(p_admin_response), ''),
+        reviewed_by = auth.uid(),
+        reviewed_at = NOW()
+    WHERE id = p_appeal_id;
+
+    IF p_decision = 'approved' THEN
+
+        -- Reverse penalty
+        UPDATE public.penalties
+        SET
+            status = 'reversed',
+            reversed_at = NOW(),
+            reversed_by = auth.uid(),
+            reversal_reason = COALESCE(
+                NULLIF(TRIM(p_admin_response), ''),
+                'Penalty reversed after appeal approval'
+            )
+        WHERE id = v_appeal.penalty_id
+          AND status = 'active';
+
+        -- Restore earning exclusions ONLY for non-incomplete penalties
+        IF v_penalty_type <> 'incomplete_lobby' THEN
+
+            UPDATE public.work_earning_exclusions
+            SET
+                is_active = FALSE,
+                reversed_at = NOW(),
+                reversed_by = auth.uid(),
+                reversal_reason = COALESCE(
+                    NULLIF(TRIM(p_admin_response), ''),
+                    'Earning exclusion reversed after appeal approval'
+                )
+            WHERE penalty_id = v_appeal.penalty_id
+              AND is_active = TRUE;
+
+        END IF;
+
+        -- Recalculate salary
+        PERFORM public.recalculate_weekly_salary(
+            v_appeal.user_id
+        );
+
+        -- Notify worker
+        INSERT INTO public.notifications (
+            user_id,
+            title,
+            message,
+            notification_type,
+            related_penalty_id
+        )
+        VALUES (
+            v_appeal.user_id,
+            'Penalty Appeal Approved',
+            CASE
+                WHEN v_penalty_type = 'incomplete_lobby'
+                THEN 'Your penalty appeal has been approved. The penalty has been reversed, but incomplete lobby earning remains excluded.'
+                ELSE 'Your appeal has been approved. The penalty and associated earning exclusion have been reversed.'
+            END,
+            'appeal_approved',
+            v_appeal.penalty_id
+        );
+
+    ELSE
+
+        -- Rejected appeal: penalty remains active
+        INSERT INTO public.notifications (
+            user_id,
+            title,
+            message,
+            notification_type,
+            related_penalty_id
+        )
+        VALUES (
+            v_appeal.user_id,
+            'Penalty Appeal Rejected',
+            'Your penalty appeal was rejected. Admin response: ' ||
+            COALESCE(
+                NULLIF(TRIM(p_admin_response), ''),
+                'No additional response'
+            ),
+            'appeal_rejected',
+            v_appeal.penalty_id
+        );
+
+    END IF;
+
+END;
+$function$
+"
+public,review_work_correction,"p_request_id uuid, p_decision text, p_admin_response text",jsonb,"CREATE OR REPLACE FUNCTION public.review_work_correction(p_request_id uuid, p_decision text, p_admin_response text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_request RECORD;
+    v_work RECORD;
+BEGIN
+    -- Verify reviewer
+    v_role := public.current_user_role();
+
+    IF v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can review corrections';
+    END IF;
+
+    IF p_decision NOT IN ('approved', 'rejected') THEN
+        RAISE EXCEPTION 'Decision must be approved or rejected';
+    END IF;
+
+    IF p_decision = 'rejected'
+       AND COALESCE(length(trim(p_admin_response)), 0) < 3 THEN
+        RAISE EXCEPTION 'Please provide a rejection reason';
+    END IF;
+
+    -- Lock correction request
+    SELECT *
+    INTO v_request
+    FROM public.work_correction_requests
+    WHERE id = p_request_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Correction request not found';
+    END IF;
+
+    IF v_request.status <> 'pending' THEN
+        RAISE EXCEPTION 'This correction request has already been reviewed';
+    END IF;
+
+    -- Verify admin permission for this member
+    IF NOT public.can_approve_work(v_request.user_id) THEN
+        RAISE EXCEPTION 'You are not authorized to review this work';
+    END IF;
+
+    -- Lock original work
+    SELECT *
+    INTO v_work
+    FROM public.work_submissions
+    WHERE id = v_request.work_submission_id
+      AND user_id = v_request.user_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Original work not found';
+    END IF;
+
+    IF v_work.status NOT IN ('pending', 'approved') THEN
+        RAISE EXCEPTION 'Correction is not allowed for this work status';
+    END IF;
+
+    IF p_decision = 'approved' THEN
+
+        -- A new video proof is mandatory
+        IF v_request.requested_video_path IS NULL
+           OR split_part(v_request.requested_video_path, '/', 1)
+              <> v_request.user_id::TEXT THEN
+            RAISE EXCEPTION 'Invalid replacement video path';
+        END IF;
+
+        -- Confirm that the uploaded video exists
+        IF NOT EXISTS (
+            SELECT 1
+            FROM storage.objects o
+            WHERE o.bucket_id = 'WORK PROOFS'
+              AND o.name = v_request.requested_video_path
+        ) THEN
+            RAISE EXCEPTION 'Replacement video not found';
+        END IF;
+
+        -- Enable controlled correction update
+        PERFORM set_config(
+            'app.allow_work_correction',
+            'on',
+            true
+        );
+
+        UPDATE public.work_submissions
+        SET
+            lobby_date = v_request.requested_lobby_date,
+            lobby_start_time = v_request.requested_lobby_start_time,
+            lobby_end_time = v_request.requested_lobby_end_time,
+            lobby_url = v_request.requested_lobby_url,
+            work_type = v_request.requested_work_type,
+            match_type = v_request.requested_match_type,
+            video_url = v_request.requested_video_path
+        WHERE id = v_request.work_submission_id;
+
+        PERFORM set_config(
+            'app.allow_work_correction',
+            'off',
+            true
+        );
+
+        -- Work UPDATE trigger automatically recalculates
+        -- the member's historical weekly salary ledger.
+
+        UPDATE public.work_correction_requests
+        SET
+            status = 'approved',
+            admin_response = p_admin_response,
+            reviewed_by = auth.uid(),
+            reviewed_at = NOW()
+        WHERE id = p_request_id;
+
+    ELSE
+
+        -- Reject without changing original work
+        UPDATE public.work_correction_requests
+        SET
+            status = 'rejected',
+            admin_response = trim(p_admin_response),
+            reviewed_by = auth.uid(),
+            reviewed_at = NOW()
+        WHERE id = p_request_id;
+
+    END IF;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'decision', p_decision,
+        'request_id', p_request_id,
+        'work_submission_id', v_request.work_submission_id
+    );
+END;
+$function$
+"
+public,rls_auto_enable,,event_trigger,"CREATE OR REPLACE FUNCTION public.rls_auto_enable()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'pg_catalog'
+AS $function$
+DECLARE
+  cmd record;
+  tbl name;
+BEGIN
+  FOR cmd IN
+    SELECT *
+    FROM pg_event_trigger_ddl_commands()
+    WHERE command_tag IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+      AND object_type IN ('table','partitioned table')
+  LOOP
+     IF cmd.schema_name IS NOT NULL AND cmd.schema_name IN ('public') AND cmd.schema_name NOT IN ('pg_catalog','information_schema') AND cmd.schema_name NOT LIKE 'pg_toast%' AND cmd.schema_name NOT LIKE 'pg_temp%' THEN
+      BEGIN
+        SELECT c.relname INTO tbl FROM pg_catalog.pg_class c WHERE c.oid = cmd.objid;
+        EXECUTE format('alter table if exists %I.%I enable row level security', cmd.schema_name, tbl);
+        RAISE LOG 'rls_auto_enable: enabled RLS on %', cmd.object_identity;
+      EXCEPTION
+        WHEN OTHERS THEN
+          RAISE LOG 'rls_auto_enable: failed to enable RLS on %', cmd.object_identity;
+      END;
+     ELSE
+        RAISE LOG 'rls_auto_enable: skip % (either system schema or not in enforced list: %.)', cmd.object_identity, cmd.schema_name;
+     END IF;
+  END LOOP;
+END;
+$function$
+"
+public,set_member_salary_zero,"p_user_id uuid, p_reason text",uuid,"CREATE OR REPLACE FUNCTION public.set_member_salary_zero(p_user_id uuid, p_reason text)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_balance NUMERIC(12,2) := 0;
+    v_adjustment NUMERIC(12,2);
+    v_adjustment_id UUID;
+BEGIN
+
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+
+    SELECT role INTO v_role
+    FROM public.profiles
+    WHERE id = auth.uid();
+
+    IF v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can adjust salary';
+    END IF;
+
+    IF p_reason IS NULL
+       OR char_length(trim(p_reason)) < 5 THEN
+        RAISE EXCEPTION 'Please provide a reason of at least 5 characters';
+    END IF;
+
+    -- Lock member profile during adjustment.
+
+    PERFORM 1
+    FROM public.profiles
+    WHERE id = p_user_id
+      AND role = 'member'
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Invalid member account';
+    END IF;
+
+    -- Recalculate existing salary first.
+
+    PERFORM public.recalculate_weekly_salary(p_user_id);
+
+    -- Read the latest current weekly closing balance.
+
+    SELECT closing_balance
+    INTO v_balance
+    FROM public.weekly_salary_ledger
+    WHERE user_id = p_user_id
+      AND week_start_date <= CURRENT_DATE
+    ORDER BY week_start_date DESC
+    LIMIT 1;
+
+    v_balance := COALESCE(v_balance, 0);
+
+    -- Adjustment brings the balance exactly to zero.
+
+    v_adjustment := -v_balance;
+
+    INSERT INTO public.salary_adjustments (
+        user_id,
+        adjustment_amount,
+        balance_before,
+        balance_after,
+        reason,
+        effective_date,
+        recorded_by
+    )
+    VALUES (
+        p_user_id,
+        v_adjustment,
+        v_balance,
+        0,
+        trim(p_reason),
+        CURRENT_DATE,
+        auth.uid()
+    )
+    RETURNING id INTO v_adjustment_id;
+
+    -- Recalculate ledger with the new adjustment.
+
+    PERFORM public.recalculate_weekly_salary(p_user_id);
+
+    RETURN v_adjustment_id;
+
+END;
+$function$
+"
+public,sync_weekly_salary_ledger,,trigger,"CREATE OR REPLACE FUNCTION public.sync_weekly_salary_ledger()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF TG_TABLE_NAME = 'work_submissions'
+       OR TG_TABLE_NAME = 'payments'
+       OR TG_TABLE_NAME = 'penalties' THEN
+
+        PERFORM public.recalculate_weekly_salary(NEW.user_id);
+
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,update_penalty_rate,"p_option_code text, p_new_amount numeric",jsonb,"CREATE OR REPLACE FUNCTION public.update_penalty_rate(p_option_code text, p_new_amount numeric)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_old_amount numeric;
+BEGIN
+    IF auth.uid() IS NULL
+       OR public.current_user_role() <> 'main_admin' THEN
+        RAISE EXCEPTION 'Only Main Admin can update penalty rates';
+    END IF;
+
+    IF p_new_amount IS NULL OR p_new_amount < 0 THEN
+        RAISE EXCEPTION 'Invalid penalty amount';
+    END IF;
+
+    SELECT unit_amount
+    INTO v_old_amount
+    FROM public.penalty_catalog
+    WHERE option_code = p_option_code
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Penalty option not found';
+    END IF;
+
+    UPDATE public.penalty_catalog
+    SET unit_amount = p_new_amount
+    WHERE option_code = p_option_code;
+
+    INSERT INTO public.penalty_rate_history (
+        option_code,
+        old_amount,
+        new_amount,
+        changed_by
+    )
+    VALUES (
+        p_option_code,
+        v_old_amount,
+        p_new_amount,
+        auth.uid()
+    );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'old_amount', v_old_amount,
+        'new_amount', p_new_amount
+    );
+END;
+$function$
+"
+public,update_pricebook_rate,"p_work_type text, p_match_type text, p_new_amount numeric",jsonb,"CREATE OR REPLACE FUNCTION public.update_pricebook_rate(p_work_type text, p_match_type text, p_new_amount numeric)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_old_amount NUMERIC(10,2);
+    v_effective_date DATE;
+    v_user_id UUID;
+BEGIN
+    -- Check logged-in user
+    v_user_id := auth.uid();
+
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+
+    -- Only Main Admin can update rates
+    IF NOT public.is_pricebook_main_admin() THEN
+        RAISE EXCEPTION 'Only Main Admin can update Pricebook rates';
+    END IF;
+
+    -- Validate work type
+    IF p_work_type NOT IN ('host', 'pt', 'host_pt') THEN
+        RAISE EXCEPTION 'Invalid work type';
+    END IF;
+
+    -- Validate match type
+    IF p_match_type NOT IN ('b2b_3', 'b2b_4', 'b2b_6') THEN
+        RAISE EXCEPTION 'Invalid match type';
+    END IF;
+
+    -- Validate amount
+    IF p_new_amount IS NULL OR p_new_amount <= 0 THEN
+        RAISE EXCEPTION 'Rate must be greater than zero';
+    END IF;
+
+    -- Next day effective date
+    v_effective_date := CURRENT_DATE + 1;
+
+    -- Get currently applicable rate for the effective date
+    SELECT amount
+    INTO v_old_amount
+    FROM public.pricebook_rates
+    WHERE work_type = p_work_type
+      AND match_type = p_match_type
+      AND effective_from <= v_effective_date
+    ORDER BY effective_from DESC
+    LIMIT 1;
+
+    IF v_old_amount IS NULL THEN
+        RAISE EXCEPTION 'Existing pricebook rate not found';
+    END IF;
+
+    -- Do not create unnecessary history for same rate
+    IF v_old_amount = p_new_amount THEN
+        RAISE EXCEPTION 'New rate is same as existing rate';
+    END IF;
+
+    -- Save rate change history
+    INSERT INTO public.pricebook_history (
+        work_type,
+        match_type,
+        old_amount,
+        new_amount,
+        changed_by,
+        effective_from
+    )
+    VALUES (
+        p_work_type,
+        p_match_type,
+        v_old_amount,
+        p_new_amount,
+        v_user_id,
+        v_effective_date
+    );
+
+    -- Insert or update next day's rate
+    INSERT INTO public.pricebook_rates (
+        work_type,
+        match_type,
+        amount,
+        effective_from,
+        changed_by
+    )
+    VALUES (
+        p_work_type,
+        p_match_type,
+        p_new_amount,
+        v_effective_date,
+        v_user_id
+    )
+    ON CONFLICT (work_type, match_type, effective_from)
+    DO UPDATE SET
+        amount = EXCLUDED.amount,
+        changed_by = EXCLUDED.changed_by,
+        created_at = NOW();
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'work_type', p_work_type,
+        'match_type', p_match_type,
+        'old_amount', v_old_amount,
+        'new_amount', p_new_amount,
+        'effective_from', v_effective_date
+    );
+END;
+$function$
+"
+public,validate_member_payment,,trigger,"CREATE OR REPLACE FUNCTION public.validate_member_payment()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_member_role TEXT;
+    v_earned_by_date NUMERIC(12,2);
+    v_penalties_by_date NUMERIC(12,2);
+    v_paid_by_date NUMERIC(12,2);
+    v_available_by_date NUMERIC(12,2);
+    v_total_earned NUMERIC(12,2);
+    v_total_penalties NUMERIC(12,2);
+    v_total_paid NUMERIC(12,2);
+    v_current_balance NUMERIC(12,2);
+BEGIN
+    -- Verify Admin or Main Admin
+    SELECT role
+    INTO v_role
+    FROM public.profiles
+    WHERE id = auth.uid();
+
+    IF v_role IS DISTINCT FROM 'admin'
+       AND v_role IS DISTINCT FROM 'main_admin' THEN
+        RAISE EXCEPTION
+            'Only Admin or Main Admin can record payments';
+    END IF;
+
+    -- Lock member account
+    SELECT role
+    INTO v_member_role
+    FROM public.profiles
+    WHERE id = NEW.user_id
+    FOR UPDATE;
+
+    IF v_member_role IS DISTINCT FROM 'member' THEN
+        RAISE EXCEPTION
+            'Payment recipient must be a member';
+    END IF;
+
+    IF NEW.recorded_by IS DISTINCT FROM auth.uid() THEN
+        RAISE EXCEPTION 'Invalid payment recorder';
+    END IF;
+
+    IF NEW.payment_date > CURRENT_DATE THEN
+        RAISE EXCEPTION
+            'Future payment dates are not allowed';
+    END IF;
+
+    IF NEW.amount IS NULL OR NEW.amount <= 0 THEN
+        RAISE EXCEPTION
+            'Payment amount must be greater than zero';
+    END IF;
+
+    -- Earnings up to selected payment date
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_earned_by_date
+    FROM public.work_submissions
+    WHERE user_id = NEW.user_id
+      AND status = 'approved'
+      AND lobby_date <= NEW.payment_date;
+
+    -- ONLY ACTIVE penalties up to selected payment date
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_penalties_by_date
+    FROM public.penalties
+    WHERE user_id = NEW.user_id
+      AND status = 'active'
+      AND lobby_date <= NEW.payment_date;
+
+    -- Existing payments up to selected payment date
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_paid_by_date
+    FROM public.payments
+    WHERE user_id = NEW.user_id
+      AND payment_date <= NEW.payment_date;
+
+    v_available_by_date :=
+        v_earned_by_date
+        - v_penalties_by_date
+        - v_paid_by_date;
+
+    -- Total approved earnings
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_total_earned
+    FROM public.work_submissions
+    WHERE user_id = NEW.user_id
+      AND status = 'approved'
+      AND lobby_date <= CURRENT_DATE;
+
+    -- ONLY ACTIVE penalties in current balance
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_total_penalties
+    FROM public.penalties
+    WHERE user_id = NEW.user_id
+      AND status = 'active'
+      AND lobby_date <= CURRENT_DATE;
+
+    -- Total payments
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_total_paid
+    FROM public.payments
+    WHERE user_id = NEW.user_id;
+
+    v_current_balance :=
+        v_total_earned
+        - v_total_penalties
+        - v_total_paid;
+
+    -- Minimum balance checks
+    IF v_available_by_date < 150 THEN
+        RAISE EXCEPTION
+            'Minimum outstanding balance of Rs.150 required on selected date. Available: Rs.%',
+            v_available_by_date;
+    END IF;
+
+    IF v_current_balance < 150 THEN
+        RAISE EXCEPTION
+            'Current outstanding balance must be at least Rs.150. Available: Rs.%',
+            v_current_balance;
+    END IF;
+
+    -- Prevent overpayment
+    IF NEW.amount > v_available_by_date
+       OR NEW.amount > v_current_balance THEN
+        RAISE EXCEPTION
+            'Payment exceeds available outstanding salary';
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,validate_penalty,,trigger,"CREATE OR REPLACE FUNCTION public.validate_penalty()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_role TEXT;
+    v_member_role TEXT;
+    v_work RECORD;
+BEGIN
+    v_role := public.current_user_role();
+
+    IF v_role IS NULL OR v_role NOT IN ('admin', 'main_admin') THEN
+        RAISE EXCEPTION 'Only Admin or Main Admin can add penalties';
+    END IF;
+
+    SELECT role
+    INTO v_member_role
+    FROM public.profiles
+    WHERE id = NEW.user_id;
+
+    IF v_member_role IS DISTINCT FROM 'member' THEN
+        RAISE EXCEPTION 'Penalty recipient must be a member';
+    END IF;
+
+    IF NEW.recorded_by IS DISTINCT FROM auth.uid() THEN
+        RAISE EXCEPTION 'Invalid penalty recorder';
+    END IF;
+
+    IF NEW.amount < 0 THEN
+        RAISE EXCEPTION 'Penalty amount cannot be negative';
+    END IF;
+
+    IF NULLIF(TRIM(NEW.reason), '') IS NULL THEN
+        RAISE EXCEPTION 'Penalty reason is required';
+    END IF;
+
+    IF NEW.penalty_type NOT IN ('approved_lobby', 'incomplete_lobby') THEN
+        RAISE EXCEPTION 'Invalid penalty type';
+    END IF;
+
+    IF NEW.penalty_type = 'approved_lobby'
+       AND NEW.work_submission_id IS NULL THEN
+        RAISE EXCEPTION 'Approved lobby penalty requires a work submission';
+    END IF;
+
+    IF NEW.work_submission_id IS NOT NULL THEN
+
+        SELECT *
+        INTO v_work
+        FROM public.work_submissions
+        WHERE id = NEW.work_submission_id
+          AND user_id = NEW.user_id
+          AND status = 'approved';
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'Linked work must be approved and belong to this member';
+        END IF;
+
+        IF NEW.lobby_date IS DISTINCT FROM v_work.lobby_date
+           OR NEW.lobby_start_time IS DISTINCT FROM v_work.lobby_start_time
+           OR NEW.lobby_end_time IS DISTINCT FROM v_work.lobby_end_time
+           OR NEW.lobby_url IS DISTINCT FROM v_work.lobby_url
+           OR REPLACE(UPPER(NEW.work_type), '_', '+')
+              IS DISTINCT FROM
+              REPLACE(UPPER(v_work.work_type), '_', '+')
+           OR REPLACE(UPPER(NEW.match_type), '_', '')
+              IS DISTINCT FROM
+              REPLACE(UPPER(v_work.match_type), '_', '') THEN
+
+            RAISE EXCEPTION
+                'Penalty details must match the original work submission';
+        END IF;
+
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
+public,validate_work_submission,,trigger,"CREATE OR REPLACE FUNCTION public.validate_work_submission()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO ''
+AS $function$
+DECLARE
+    approver_role TEXT;
+    submitter_role TEXT;
+    calculated_amount NUMERIC(10,2);
+    correction_mode BOOLEAN;
+BEGIN
+    approver_role := public.current_user_role();
+
+    correction_mode :=
+        COALESCE(
+            current_setting('app.allow_work_correction', true),
+            'off'
+        ) = 'on';
+
+    IF TG_OP = 'INSERT' THEN
+
+        IF NEW.user_id IS DISTINCT FROM auth.uid()
+           OR COALESCE(approver_role, '') NOT IN ('member', 'admin', 'main_admin')
+           OR NEW.status <> 'pending'
+           OR NEW.amount IS DISTINCT FROM 0
+           OR NEW.approved_by IS NOT NULL
+           OR NEW.approved_at IS NOT NULL THEN
+            RAISE EXCEPTION 'Invalid work submission';
+        END IF;
+
+        -- Main Admin work is automatically approved.
+        IF approver_role = 'main_admin' THEN
+
+            SELECT pr.amount
+            INTO calculated_amount
+            FROM public.pricebook_rates pr
+            WHERE pr.work_type = NEW.work_type
+              AND pr.match_type = NEW.match_type
+              AND pr.effective_from <= NEW.lobby_date
+            ORDER BY pr.effective_from DESC
+            LIMIT 1;
+
+            IF calculated_amount IS NULL THEN
+                RAISE EXCEPTION 'Applicable Pricebook rate not found';
+            END IF;
+
+            NEW.amount := calculated_amount;
+            NEW.status := 'approved';
+            NEW.approved_by := auth.uid();
+            NEW.approved_at := NOW();
+            NEW.rejection_reason := NULL;
+
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- Preserve existing controlled correction functionality.
+    IF correction_mode THEN
+
+        IF approver_role NOT IN ('admin', 'main_admin')
+           OR NEW.user_id IS DISTINCT FROM OLD.user_id
+           OR NEW.status IS DISTINCT FROM OLD.status
+           OR NEW.approved_by IS DISTINCT FROM OLD.approved_by
+           OR NEW.approved_at IS DISTINCT FROM OLD.approved_at
+           OR NEW.rejection_reason IS DISTINCT FROM OLD.rejection_reason
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+            RAISE EXCEPTION 'Invalid correction authorization';
+        END IF;
+
+        IF OLD.status NOT IN ('pending', 'approved') THEN
+            RAISE EXCEPTION 'Correction not allowed for this work status';
+        END IF;
+
+        IF OLD.status = 'approved' THEN
+
+            SELECT pr.amount
+            INTO calculated_amount
+            FROM public.pricebook_rates pr
+            WHERE pr.work_type = NEW.work_type
+              AND pr.match_type = NEW.match_type
+              AND pr.effective_from <= NEW.lobby_date
+            ORDER BY pr.effective_from DESC
+            LIMIT 1;
+
+            IF calculated_amount IS NULL THEN
+                RAISE EXCEPTION 'Applicable Pricebook rate not found';
+            END IF;
+
+            NEW.amount := calculated_amount;
+        ELSE
+            NEW.amount := 0;
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- Keep original submission details immutable.
+    IF NEW.user_id IS DISTINCT FROM OLD.user_id
+       OR NEW.lobby_date IS DISTINCT FROM OLD.lobby_date
+       OR NEW.lobby_start_time IS DISTINCT FROM OLD.lobby_start_time
+       OR NEW.lobby_end_time IS DISTINCT FROM OLD.lobby_end_time
+       OR NEW.lobby_url IS DISTINCT FROM OLD.lobby_url
+       OR NEW.video_url IS DISTINCT FROM OLD.video_url
+       OR NEW.work_type IS DISTINCT FROM OLD.work_type
+       OR NEW.match_type IS DISTINCT FROM OLD.match_type THEN
+        RAISE EXCEPTION 'Submitted work details cannot be changed';
+    END IF;
+
+    IF OLD.status <> 'pending'
+       OR NEW.status NOT IN ('approved', 'rejected')
+       OR OLD.status = NEW.status THEN
+        RAISE EXCEPTION 'Only pending work can be approved or rejected';
+    END IF;
+
+    SELECT p.role
+    INTO submitter_role
+    FROM public.profiles p
+    WHERE p.id = OLD.user_id
+      AND p.is_active = TRUE;
+
+    IF submitter_role IS NULL
+       OR OLD.user_id = auth.uid()
+       OR NOT (
+           approver_role = 'main_admin'
+           OR (
+               approver_role = 'admin'
+               AND submitter_role = 'member'
+           )
+       ) THEN
+        RAISE EXCEPTION 'You are not authorized to approve this work';
+    END IF;
+
+    IF NEW.status = 'approved' THEN
+
+        SELECT pr.amount
+        INTO calculated_amount
+        FROM public.pricebook_rates pr
+        WHERE pr.work_type = NEW.work_type
+          AND pr.match_type = NEW.match_type
+          AND pr.effective_from <= NEW.lobby_date
+        ORDER BY pr.effective_from DESC
+        LIMIT 1;
+
+        IF calculated_amount IS NULL THEN
+            RAISE EXCEPTION 'Applicable Pricebook rate not found';
+        END IF;
+
+        NEW.amount := calculated_amount;
+        NEW.approved_by := auth.uid();
+        NEW.approved_at := NOW();
+        NEW.rejection_reason := NULL;
+
+    ELSE
+        NEW.amount := 0;
+        NEW.approved_by := auth.uid();
+        NEW.approved_at := NOW();
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+"
